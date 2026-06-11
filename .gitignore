@@ -1,0 +1,10 @@
+# MediaPipe Model Files
+*.task
+
+# Python virtual environment
+/venv/
+/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
