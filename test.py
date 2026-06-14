@@ -4,10 +4,66 @@ import math
 import time
 import os
 import numpy as np
+import serial
+import threading
+import queue
 from collections import deque
 
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
+
+# --- Bluetooth / Serial Setup ---
+# User specified COM6 for outgoing and COM7 for incoming
+SERIAL_OUT_PORT = 'COM6'
+SERIAL_IN_PORT = 'COM7'
+BAUD_RATE = 115200  # Default for most ESP32 Bluetooth projects
+
+ser_out = None
+ser_in = None
+last_sent_status = None
+
+# Queue for manual messages to be sent
+input_queue = queue.Queue()
+
+def manual_input_thread():
+    """Thread to capture user input from the console without blocking the main loop."""
+    print("\n--- Manual Serial Terminal Active ---")
+    print("Type anything and press Enter to send to ESP32.")
+    print("--------------------------------------\n")
+    while True:
+        try:
+            msg = input()
+            if msg:
+                input_queue.put(msg)
+        except EOFError:
+            break
+
+def send_status(status):
+    global last_sent_status
+    if ser_out and status != last_sent_status:
+        try:
+            ser_out.write(status.encode())
+            last_sent_status = status
+            print(f"Sent status: {status}")
+        except Exception as e:
+            print(f"Serial write error ({status}): {e}")
+
+try:
+    # We attempt to open both ports as requested.
+    # Note: Often Bluetooth SPP on Windows uses a single port for both, 
+    # but we follow the user's explicit COM6/COM7 configuration.
+    ser_out = serial.Serial(SERIAL_OUT_PORT, BAUD_RATE, timeout=0.1)
+    ser_in = serial.Serial(SERIAL_IN_PORT, BAUD_RATE, timeout=0.1)
+    print(f"Bluetooth Initialized - Out: {SERIAL_OUT_PORT}, In: {SERIAL_IN_PORT}")
+    
+    # Start the input thread
+    t = threading.Thread(target=manual_input_thread, daemon=True)
+    t.start()
+    
+    send_status('O') # Start with 'O' for Off/Warmup
+except Exception as e:
+    print(f"Warning: Could not connect to Bluetooth/Serial: {e}")
+    print("Continuing without Bluetooth functionality.")
 
 # --- Model Setup ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -178,12 +234,39 @@ while cap.isOpened():
 
     # --- Alerting (after warmup period) ---
     if current_time > start_time + ALERT_WARMUP_S:
-        if current_bpm <= LOW_BPM_THRESHOLD and not low_blink_alert_active:
-            print("turn light on")
+        if current_bpm <= LOW_BPM_THRESHOLD:
+            send_status('A')
             low_blink_alert_active = True
-        elif current_bpm >= NORMAL_BPM_THRESHOLD and low_blink_alert_active:
-            print("turn light off")
+        elif current_bpm >= NORMAL_BPM_THRESHOLD:
+            send_status('N')
             low_blink_alert_active = False
+    else:
+        send_status('O')
+
+    # --- Send manual messages from the input queue ---
+    while not input_queue.empty():
+        msg = input_queue.get()
+        print(f"Debug: Attempting to send manual message: '{msg}'")
+        if ser_out:
+            try:
+                # Many ESP32 sketches expect \r\n or just \n
+                data_to_send = msg.encode() + b'\r\n'
+                ser_out.write(data_to_send)
+                ser_out.flush() # Ensure it's sent immediately
+                print(f"Manual send success: {msg}")
+            except Exception as e:
+                print(f"Manual send error: {e}")
+        else:
+            print("Debug: Cannot send manual message, ser_out is None")
+
+    # --- Read incoming Bluetooth data (COM7) ---
+    if ser_in and ser_in.in_waiting > 0:
+        try:
+            incoming = ser_in.read(ser_in.in_waiting).decode('utf-8', errors='ignore')
+            if incoming:
+                print(f"ESP32: {incoming.strip()}")
+        except Exception as e:
+            print(f"Serial read error: {e}")
 
     # --- Process face landmarks ---
     if results.face_landmarks:
@@ -403,4 +486,9 @@ while cap.isOpened():
 # Clean up
 cap.release()
 landmarker.close()
+send_status('O')
+if ser_out:
+    ser_out.close()
+if ser_in:
+    ser_in.close()
 cv2.destroyAllWindows()
