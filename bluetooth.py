@@ -1,13 +1,69 @@
-import cv2
+﻿import cv2
 import mediapipe as mp
 import math
 import time
 import os
 import numpy as np
+import serial
+import threading
+import queue
 from collections import deque
 
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
+
+# --- Bluetooth / Serial Setup ---
+# User specified COM6 for outgoing and COM7 for incoming
+SERIAL_OUT_PORT = 'COM6'
+SERIAL_IN_PORT = 'COM7'
+BAUD_RATE = 115200  # Default for most ESP32 Bluetooth projects
+
+ser_out = None
+ser_in = None
+last_sent_status = None
+
+# Queue for manual messages to be sent
+input_queue = queue.Queue()
+
+def manual_input_thread():
+    """Thread to capture user input from the console without blocking the main loop."""
+    print("\n--- Manual Serial Terminal Active ---")
+    print("Type anything and press Enter to send to ESP32.")
+    print("--------------------------------------\n")
+    while True:
+        try:
+            msg = input()
+            if msg:
+                input_queue.put(msg)
+        except EOFError:
+            break
+
+def send_status(status):
+    global last_sent_status
+    if ser_out and status != last_sent_status:
+        try:
+            ser_out.write(status.encode())
+            last_sent_status = status
+            print(f"Sent status: {status}")
+        except Exception as e:
+            print(f"Serial write error ({status}): {e}")
+
+try:
+    # We attempt to open both ports as requested.
+    # Note: Often Bluetooth SPP on Windows uses a single port for both, 
+    # but we follow the user's explicit COM6/COM7 configuration.
+    ser_out = serial.Serial(SERIAL_OUT_PORT, BAUD_RATE, timeout=0.1)
+    ser_in = serial.Serial(SERIAL_IN_PORT, BAUD_RATE, timeout=0.1)
+    print(f"Bluetooth Initialized - Out: {SERIAL_OUT_PORT}, In: {SERIAL_IN_PORT}")
+    
+    # Start the input thread
+    t = threading.Thread(target=manual_input_thread, daemon=True)
+    t.start()
+    
+    send_status('O') # Start with 'O' for Off/Warmup
+except Exception as e:
+    print(f"Warning: Could not connect to Bluetooth/Serial: {e}")
+    print("Continuing without Bluetooth functionality.")
 
 # --- Model Setup ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,45 +86,45 @@ RIGHT_EYE = [362, 380, 374, 263, 386, 385]
 # =====================================================================
 #  BLINK DETECTION PARAMETERS
 # =====================================================================
-# Hysteresis thresholds — two separate thresholds prevent false triggers
+# Hysteresis thresholds â€” two separate thresholds prevent false triggers
 # when the EAR hovers near a single value. The EAR must DROP below the
 # close threshold to start a blink, then RISE above the open threshold
 # to finish it. The gap between them is a dead zone where noise is ignored.
 #
 # These are the initial values; they adapt automatically after warmup.
-EAR_CLOSE_THRESHOLD = 0.18   # EAR must fall below this → eye is closing
-EAR_OPEN_THRESHOLD  = 0.23   # EAR must rise above this → eye is open again
+EAR_CLOSE_THRESHOLD = 0.18   # EAR must fall below this â†’ eye is closing
+EAR_OPEN_THRESHOLD  = 0.23   # EAR must rise above this â†’ eye is open again
 
-# Adaptive baseline — adjusts thresholds to your face and camera
+# Adaptive baseline â€” adjusts thresholds to your face and camera
 WARMUP_FRAMES = 60            # Frames to collect before adapting (~2s at 30fps)
 BASELINE_UPDATE_EVERY = 20    # Recalculate thresholds every N frames
-CLOSE_RATIO = 0.82            # Close threshold = baseline × 0.82 (sensitive)
-OPEN_RATIO  = 0.90            # Open threshold  = baseline × 0.90
-BLINK_DEPTH_RATIO = 0.70      # Absolute depth: min EAR must reach baseline × this
-MIN_RELATIVE_DROP = 0.08      # Relative drop: EAR must fall ≥8% from last open value
+CLOSE_RATIO = 0.82            # Close threshold = baseline Ã— 0.82 (sensitive)
+OPEN_RATIO  = 0.90            # Open threshold  = baseline Ã— 0.90
+BLINK_DEPTH_RATIO = 0.70      # Absolute depth: min EAR must reach baseline Ã— this
+MIN_RELATIVE_DROP = 0.08      # Relative drop: EAR must fall â‰¥8% from last open value
 # A blink passes validation if EITHER depth check succeeds.
 
-# Wink filter — reject single-eye closures (intentional winks)
-# If the OTHER eye's EAR stays above baseline × this ratio during the
-# closure, only one eye closed → it's a wink, not a natural blink.
+# Wink filter â€” reject single-eye closures (intentional winks)
+# If the OTHER eye's EAR stays above baseline Ã— this ratio during the
+# closure, only one eye closed â†’ it's a wink, not a natural blink.
 WINK_MAX_EAR_RATIO = 0.92
 
-# Dip detector — catches blinks the hysteresis misses at low FPS.
+# Dip detector â€” catches blinks the hysteresis misses at low FPS.
 # At low FPS the camera may only see the EAR start to drop and then recover,
 # never actually crossing the close threshold. This detector tracks the
 # recent EAR peak, watches for any dip, and validates when recovery is
 # detected. Works across any number of frames (not just 3).
-DIP_MIN_DROP_RATIO = 0.03     # Must drop ≥3% of baseline from peak to trough
-DIP_MIN_RECOVERY_RATIO = 0.02 # Must recover ≥2% of baseline from trough
+DIP_MIN_DROP_RATIO = 0.03     # Must drop â‰¥3% of baseline from peak to trough
+DIP_MIN_RECOVERY_RATIO = 0.02 # Must recover â‰¥2% of baseline from trough
 DIP_MAX_DURATION_S = 0.5      # Peak-to-recovery must complete within this
 
-# Blendshape blink detection — uses MediaPipe's neural network blink scores.
+# Blendshape blink detection â€” uses MediaPipe's neural network blink scores.
 # More robust than EAR at low FPS because the model is trained to recognize
-# blink patterns even from partially-closed frames. Scores range 0–1.
+# blink patterns even from partially-closed frames. Scores range 0â€“1.
 BS_BLINK_THRESHOLD = 0.5      # Score above this = eye is closing
 BS_OPEN_THRESHOLD = 0.3       # Score below this = eye is open again
 
-# Eye occlusion — detect when a hand covers one eye.
+# Eye occlusion â€” detect when a hand covers one eye.
 # If one eye's EAR is consistently much lower than the other for several
 # frames, it's probably covered. Switch to using only the uncovered eye.
 # (Brief disparities like winks are only 1-2 frames, so the frame count
@@ -76,10 +132,15 @@ BS_OPEN_THRESHOLD = 0.3       # Score below this = eye is open again
 OCCLUSION_DISPARITY = 0.5     # Flag if one eye EAR < 50% of the other
 OCCLUSION_CONFIRM_FRAMES = 5  # Must persist this many frames to confirm
 
-# Duration constraints — a real blink is 50–400ms
+# Duration constraints â€” a real blink is 50â€“400ms
 MIN_BLINK_DURATION_S = 0.05   # Shorter = noise or tracking glitch
 MAX_BLINK_DURATION_S = 0.5    # Longer = intentional close or squint
 BLINK_COOLDOWN_S = 0.25       # Ignore re-triggers within this window
+
+# Alerting
+LOW_BPM_THRESHOLD = 7         # Alert when BPM drops to this
+NORMAL_BPM_THRESHOLD = 12     # Clear alert when BPM returns to this
+ALERT_WARMUP_S = 60           # Don't alert during the first 60 seconds
 
 # =====================================================================
 #  STATE
@@ -87,18 +148,18 @@ BLINK_COOLDOWN_S = 0.25       # Ignore re-triggers within this window
 eye_closed = False
 eye_close_start_time = None
 min_ear_during_close = 1.0    # Tracks how deep the min EAR drops during a closure
-max_ear_during_close = 0.0    # Tracks the other eye — high = wink, low = both eyes
+max_ear_during_close = 0.0    # Tracks the other eye â€” high = wink, low = both eyes
 pre_close_ear = 0.3           # min EAR on the last open frame before closure started
 prev_ear = 0.3                # min EAR from the previous frame (for drop calculation)
 last_blink_time = 0
 
-# Dip detector state — tracks peak, trough, and recovery
+# Dip detector state â€” tracks peak, trough, and recovery
 dip_peak_ear = 0.0            # Recent local maximum EAR
 dip_peak_time = 0.0           # When the peak was recorded
 dip_trough_ear = 1.0          # Lowest EAR since peak
 dip_trough_max_ear = 1.0      # Other eye's min EAR at trough (wink check)
 
-# Occlusion state — per-eye counters for sustained low EAR
+# Occlusion state â€” per-eye counters for sustained low EAR
 left_low_count = 0
 right_low_count = 0
 left_occluded = False
@@ -109,11 +170,12 @@ bs_blink_active = False       # True while blendshape says eye is closing
 
 blink_timestamps = deque()     # Timestamps of recent blinks (last 60s)
 current_bpm = 0
+low_blink_alert_active = False
 
 ear_history = deque(maxlen=450)  # ~15s at 30fps for baseline calculation
 frame_count = 0
 baseline_ear = 0.28           # Current baseline (updated adaptively)
-blink_depth_threshold = 0.15  # Computed from baseline × BLINK_DEPTH_RATIO
+blink_depth_threshold = 0.15  # Computed from baseline Ã— BLINK_DEPTH_RATIO
 start_time = time.time()
 
 # =====================================================================
@@ -170,6 +232,42 @@ while cap.isOpened():
         blink_timestamps.popleft()
     current_bpm = len(blink_timestamps)
 
+    # --- Alerting (after warmup period) ---
+    if current_time > start_time + ALERT_WARMUP_S:
+        if current_bpm <= LOW_BPM_THRESHOLD:
+            send_status('A')
+            low_blink_alert_active = True
+        elif current_bpm >= NORMAL_BPM_THRESHOLD:
+            send_status('N')
+            low_blink_alert_active = False
+    else:
+        send_status('O')
+
+    # --- Send manual messages from the input queue ---
+    while not input_queue.empty():
+        msg = input_queue.get()
+        print(f"Debug: Attempting to send manual message: '{msg}'")
+        if ser_out:
+            try:
+                # Many ESP32 sketches expect \r\n or just \n
+                data_to_send = msg.encode() + b'\r\n'
+                ser_out.write(data_to_send)
+                ser_out.flush() # Ensure it's sent immediately
+                print(f"Manual send success: {msg}")
+            except Exception as e:
+                print(f"Manual send error: {e}")
+        else:
+            print("Debug: Cannot send manual message, ser_out is None")
+
+    # --- Read incoming Bluetooth data (COM7) ---
+    if ser_in and ser_in.in_waiting > 0:
+        try:
+            incoming = ser_in.read(ser_in.in_waiting).decode('utf-8', errors='ignore')
+            if incoming:
+                print(f"ESP32: {incoming.strip()}")
+        except Exception as e:
+            print(f"Serial read error: {e}")
+
     # --- Process face landmarks ---
     if results.face_landmarks:
         for face_landmarks_list in results.face_landmarks:
@@ -225,11 +323,11 @@ while cap.isOpened():
             #  drives detection. This catches asymmetric blinks that
             #  the average would miss.
             #
-            #    OPEN ──(det_ear < close_threshold)──► CLOSED
-            #    CLOSED ─(det_ear > open_threshold)──► OPEN  (+ validate)
+            #    OPEN â”€â”€(det_ear < close_threshold)â”€â”€â–º CLOSED
+            #    CLOSED â”€(det_ear > open_threshold)â”€â”€â–º OPEN  (+ validate)
             # ==========================================================
             if not eye_closed:
-                # Eyes are open — watch for either eye to close
+                # Eyes are open â€” watch for either eye to close
                 if det_ear < EAR_CLOSE_THRESHOLD:
                     eye_closed = True
                     eye_close_start_time = current_time
@@ -237,7 +335,7 @@ while cap.isOpened():
                     max_ear_during_close = max_ear
                     pre_close_ear = prev_ear  # snapshot the last open min EAR
             else:
-                # Eyes are closed — track depth and the other eye
+                # Eyes are closed â€” track depth and the other eye
                 if det_ear < min_ear_during_close:
                     min_ear_during_close = det_ear
                 # Track the max EAR seen during closure (lowest value = both
@@ -247,7 +345,7 @@ while cap.isOpened():
 
                 # Watch for them to reopen
                 if det_ear > EAR_OPEN_THRESHOLD:
-                    # Eyes reopened — validate the blink
+                    # Eyes reopened â€” validate the blink
                     duration = current_time - eye_close_start_time
 
                     # Depth check (either path confirms a real blink):
@@ -256,7 +354,7 @@ while cap.isOpened():
                     steep_enough = relative_drop >= MIN_RELATIVE_DROP
 
                     # Wink filter: if the OTHER eye stayed wide open the
-                    # whole time, this was a deliberate wink — don't count it.
+                    # whole time, this was a deliberate wink â€” don't count it.
                     wink_threshold = baseline_ear * WINK_MAX_EAR_RATIO
                     is_wink = max_ear_during_close > wink_threshold
 
@@ -280,7 +378,7 @@ while cap.isOpened():
             #
             #  Tracks the EAR's recent peak and watches for dips.
             #  When the EAR drops from the peak and then recovers,
-            #  that's a blink — even if it never crossed the close
+            #  that's a blink â€” even if it never crossed the close
             #  threshold. Works across any number of frames.
             #
             #  Gaze shifts are gradual (no sharp recovery within the
@@ -303,7 +401,7 @@ while cap.isOpened():
                 if (drop >= min_drop_val and recovery >= min_recovery_val
                         and duration <= DIP_MAX_DURATION_S
                         and (current_time - last_blink_time) > BLINK_COOLDOWN_S):
-                    # Valid dip with recovery — check wink filter
+                    # Valid dip with recovery â€” check wink filter
                     wink_threshold = baseline_ear * WINK_MAX_EAR_RATIO
                     is_wink = dip_trough_max_ear > wink_threshold
                     if not is_wink:
@@ -316,19 +414,19 @@ while cap.isOpened():
                     dip_trough_ear = det_ear
                     dip_trough_max_ear = max_ear
                 elif duration > DIP_MAX_DURATION_S:
-                    # Timeout — dip took too long, not a blink. Reset.
+                    # Timeout â€” dip took too long, not a blink. Reset.
                     dip_peak_ear = det_ear
                     dip_peak_time = current_time
                     dip_trough_ear = det_ear
                     dip_trough_max_ear = max_ear
                 elif det_ear >= dip_peak_ear:
-                    # New peak — EAR is higher than before, reset tracking
+                    # New peak â€” EAR is higher than before, reset tracking
                     dip_peak_ear = det_ear
                     dip_peak_time = current_time
                     dip_trough_ear = det_ear
                     dip_trough_max_ear = max_ear
             else:
-                # Hysteresis is handling this blink — reset dip tracker
+                # Hysteresis is handling this blink â€” reset dip tracker
                 dip_peak_ear = det_ear
                 dip_peak_time = current_time
                 dip_trough_ear = det_ear
@@ -339,7 +437,7 @@ while cap.isOpened():
             # ==========================================================
             #  BLENDSHAPE BLINK DETECTION (most robust at low FPS)
             #
-            #  MediaPipe's neural network outputs blink scores (0–1)
+            #  MediaPipe's neural network outputs blink scores (0â€“1)
             #  for each eye. These are trained to recognize blinks even
             #  from partially-closed frames that EAR can't detect.
             #  Uses min(left, right) to filter winks.
@@ -388,4 +486,9 @@ while cap.isOpened():
 # Clean up
 cap.release()
 landmarker.close()
+send_status('O')
+if ser_out:
+    ser_out.close()
+if ser_in:
+    ser_in.close()
 cv2.destroyAllWindows()
