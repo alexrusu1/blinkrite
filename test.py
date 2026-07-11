@@ -11,6 +11,15 @@ from collections import deque
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
+# Import shared constants and functions from the new utility file
+from eye_feature_utils import (
+    calculate_ear,
+    LEFT_EYE_EAR_INDICES,
+    RIGHT_EYE_EAR_INDICES,
+    ALL_EYE_INDICES,
+    NOSE_TIP_INDEX
+)
+
 # --- Configuration ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,28 +37,36 @@ options = vision.FaceLandmarkerOptions(
 landmarker = vision.FaceLandmarker.create_from_options(options)
 
 # --- Model & Scaler Loading ---
-MODEL_MLP_PATH = os.path.join(script_dir, "blink_model.keras")
-SCALER_PATH = os.path.join(script_dir, "scaler.joblib")
+# We trained separate models for 15fps and 30fps (a fixed-length frame
+# sequence encodes a different real-world time window at each rate, so one
+# model can't cleanly serve both). Whichever camera fps we measure below,
+# pick whichever trained model is closest and, if the camera runs faster
+# than that model expects, drop frames so the model sees the same
+# frame-to-frame timing it was trained on.
+AVAILABLE_MODELS = {
+    15: ("blink_model_15fps.keras", "scaler_15fps.joblib"),
+    30: ("blink_model_30fps.keras", "scaler_30fps.joblib"),
+}
 SEQUENCE_LENGTH = 5 # Must match the training script
 BLINK_PROB_THRESHOLD = 0.9 # Confidence threshold for blink detection
 
-print("Loading model and scaler...")
-try:
-    model = tf.keras.models.load_model(MODEL_MLP_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    print("Model and scaler loaded successfully.")
-except Exception as e:
-    print(f"Error loading model or scaler: {e}")
-    print(f"Please ensure '{MODEL_MLP_PATH}' and '{SCALER_PATH}' are in the same directory.")
-    exit()
 
-# --- Landmark Indices (from training scripts) ---
-LEFT_EYE_EAR_INDICES = [33, 159, 158, 133, 153, 145]
-RIGHT_EYE_EAR_INDICES = [362, 380, 374, 263, 386, 385]
-LEFT_EYE_CONTOUR_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-RIGHT_EYE_CONTOUR_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-ALL_EYE_INDICES = LEFT_EYE_CONTOUR_INDICES + RIGHT_EYE_CONTOUR_INDICES
-NOSE_TIP_INDEX = 1
+def measure_camera_fps(cap, num_frames=20):
+    """Measure the camera's actual delivered frame rate (not just its
+    reported nominal rate, which many webcams misreport)."""
+    for _ in range(5):  # warm up / let exposure settle
+        cap.read()
+    start = time.time()
+    count = 0
+    for _ in range(num_frames):
+        success, _ = cap.read()
+        if not success:
+            break
+        count += 1
+    elapsed = time.time() - start
+    if elapsed <= 0 or count == 0:
+        return 30.0  # sane fallback
+    return count / elapsed
 
 # =====================================================================
 #  BLINK DETECTION PARAMETERS
@@ -70,37 +87,51 @@ BS_OPEN_THRESHOLD = 0.25      # Was 0.3. Reset when eyes are more open.
 #  STATE
 # =====================================================================
 feature_history = deque(maxlen=SEQUENCE_LENGTH)
-blink_detected = False
-last_blink_time = 0
 
-# State for MediaPipe's built-in blink detector
-bs_blink_active = False
-last_bs_blink_time = 0
+# Unified state for any blink event
+blink_event_detected = False
+last_blink_time = 0
 
 blink_timestamps = deque()     # Timestamps of recent blinks (last 60s)
 current_bpm = 0
 
+# Persists across frames we skip for the MLP (see FRAME_STEP) so the display
+# doesn't flicker back to 0 between sampled frames.
+blink_prob = 0.0
+
 # =====================================================================
-#  HELPERS
+#  CAMERA + MODEL SELECTION
 # =====================================================================
+cap = cv2.VideoCapture(0)
 
-def calculate_distance(p1, p2):
-    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+print("Measuring camera frame rate...")
+measured_fps = measure_camera_fps(cap)
+chosen_fps = min(AVAILABLE_MODELS.keys(), key=lambda f: abs(f - measured_fps))
+model_name, scaler_name = AVAILABLE_MODELS[chosen_fps]
+MODEL_MLP_PATH = os.path.join(script_dir, model_name)
+SCALER_PATH = os.path.join(script_dir, scaler_name)
+# If the camera delivers faster than the chosen model expects (e.g. a 60fps
+# camera against the 30fps model), drop frames so the sequence fed to the
+# model has the same frame-to-frame timing it was trained on.
+FRAME_STEP = max(1, round(measured_fps / chosen_fps))
+print(f"Measured camera fps: {measured_fps:.1f} -> using {chosen_fps}fps model "
+      f"({model_name}), sampling every {FRAME_STEP} frame(s).")
 
-
-def calculate_ear(landmarks, eye_indices):
-    v1 = calculate_distance(landmarks[eye_indices[1]], landmarks[eye_indices[5]])
-    v2 = calculate_distance(landmarks[eye_indices[2]], landmarks[eye_indices[4]])
-    h  = calculate_distance(landmarks[eye_indices[0]], landmarks[eye_indices[3]])
-    if h == 0:
-        return 0.0
-    return (v1 + v2) / (2.0 * h)
+print("Loading model and scaler...")
+try:
+    model = tf.keras.models.load_model(MODEL_MLP_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    print("Model and scaler loaded successfully.")
+except Exception as e:
+    print(f"Error loading model or scaler: {e}")
+    print(f"Please ensure '{MODEL_MLP_PATH}' and '{SCALER_PATH}' are in the same directory.")
+    exit()
 
 # =====================================================================
 #  MAIN LOOP
 # =====================================================================
-cap = cv2.VideoCapture(0)
 print("Starting camera... Press 'q' to quit.")
+frame_counter = 0
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -121,7 +152,8 @@ while cap.isOpened():
     current_bpm = len(blink_timestamps)
 
     # --- Process face landmarks ---
-    blink_prob = 0.0
+    # blink_prob intentionally not reset here - it persists across frames
+    # skipped by FRAME_STEP (see STATE section above).
     left_blink_score = 0.0
     right_blink_score = 0.0
 
@@ -131,17 +163,22 @@ while cap.isOpened():
             blendshapes = {bs.category_name: bs.score for bs in results.face_blendshapes[0]}
             left_blink_score = blendshapes.get('eyeBlinkLeft', 0)
             right_blink_score = blendshapes.get('eyeBlinkRight', 0)
-            blink_score = (left_blink_score + right_blink_score) / 2.0
+            # Use the minimum score to be more robust against winks.
+            # If one eye is open (low score), the result will be low.
+            blink_score = min(left_blink_score, right_blink_score)
 
-            if blink_score > BS_BLINK_THRESHOLD and not bs_blink_active and (current_time - last_bs_blink_time > BLINK_COOLDOWN_S):
-                bs_blink_active = True
-                last_bs_blink_time = current_time
-                print("--- MEDIAPIPE BLINK DETECTED ---")
-            elif blink_score < BS_OPEN_THRESHOLD:
-                bs_blink_active = False
+            # If blendshape detects a blink and cooldown is over, trigger a unified event
+            if blink_score > BS_BLINK_THRESHOLD and not blink_event_detected and (current_time - last_blink_time > BLINK_COOLDOWN_S):
+                blink_event_detected = True
+                last_blink_time = current_time # Update the shared cooldown
+                blink_timestamps.append(current_time) # Add to BPM counter
+                print(f"--- MEDIAPIPE BLINK DETECTED (Score: {blink_score:.2f}) ---")
 
         # --- CUSTOM MLP-BASED BLINK DETECTION ---
-        if len(results.face_landmarks) > 0:
+        # Only sample every FRAME_STEP-th real frame into the sequence, so
+        # its frame-to-frame timing matches what the chosen model trained on
+        # (relevant when the camera runs faster than that model's fps).
+        if len(results.face_landmarks) > 0 and frame_counter % FRAME_STEP == 0:
             landmarks = results.face_landmarks[0]
 
             # --- Feature Extraction (must match training script) ---
@@ -173,37 +210,41 @@ while cap.isOpened():
                 blink_prob = model.predict(sequence_scaled, verbose=0)[0][0]
 
                 # 4. Detect blink event with state machine and cooldown
-                if blink_prob > BLINK_PROB_THRESHOLD and not blink_detected and (current_time - last_blink_time > BLINK_COOLDOWN_S):
-                    blink_detected = True
+                if blink_prob > BLINK_PROB_THRESHOLD and not blink_event_detected and (current_time - last_blink_time > BLINK_COOLDOWN_S):
+                    blink_event_detected = True
                     last_blink_time = current_time
                     blink_timestamps.append(current_time)
                     print(f"*** BLINK DETECTED (Prob: {blink_prob:.2f}) ***")
-                elif blink_prob < 0.5: # Reset state when eyes are clearly open
-                    blink_detected = False
+
+    # Reset the unified blink state if both detectors show eyes are open
+    if blink_event_detected and blink_prob < 0.5 and min(left_blink_score, right_blink_score) < BS_OPEN_THRESHOLD:
+        blink_event_detected = False
 
     # --- On-screen display ---
     # Custom Model Display
-    custom_model_status_text = "Blink Detected!" if blink_detected else ""
     color_prob = (0, 255, 0) if blink_prob < 0.5 else (0, 165, 255)
     if blink_prob > BLINK_PROB_THRESHOLD:
         color_prob = (0, 0, 255)
 
     cv2.putText(frame, f"Custom Model Prob: {blink_prob:.2f}", (30, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_prob, 2)
-    if custom_model_status_text:
-            cv2.putText(frame, "Custom Blink!", (30, 150),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
 
     # MediaPipe Blendshape Display
     bs_score = (left_blink_score + right_blink_score) / 2.0
-    bs_status_text = "Blink Detected!" if bs_blink_active else ""
     cv2.putText(frame, f"MediaPipe Score: {bs_score:.2f}", (30, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-    if bs_status_text:
-            cv2.putText(frame, "MediaPipe Blink!", (30, 190),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
+
+    # Unified Blink Indicator
+    if blink_event_detected:
+        cv2.putText(frame, "BLINK!", (30, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+
+    # BPM Display
+    cv2.putText(frame, f"BPM: {current_bpm}", (30, 230),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
     cv2.imshow('Blink Tracker', frame)
+    frame_counter += 1
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 

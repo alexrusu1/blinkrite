@@ -1,10 +1,26 @@
-# MediaPipe Model Files
-*.task
-
-# Python virtual environment
-/venv/
-/.venv/
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
+
+# Virtual Environment
+venv/
+tf_env/
+
+# Data files - These can be large and should not be in version control
+*.csv
+*.mp4
+
+# Model and Scaler files
+*.keras
+*.joblib
+*.task
+# ...except the deployed inference artifacts, small enough to version and
+# needed to run test.py on another machine without retraining.
+!blink_model_15fps.keras
+!blink_model_30fps.keras
+!scaler_15fps.joblib
+!scaler_30fps.joblib
+!face_landmarker.task
+
+# Output files
+*.png
