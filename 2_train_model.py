@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -7,9 +8,18 @@ import matplotlib.pyplot as plt
 import joblib # For saving the scaler object
 
 # --- Configuration ---
-INPUT_CSV_FILE = 'blink_data.csv'
-MODEL_SAVE_PATH = 'blink_model.keras'
-SCALER_SAVE_PATH = 'scaler.joblib' # Path to save the scaler
+parser = argparse.ArgumentParser(description="Train an fps-specific blink model.")
+parser.add_argument('--fps', type=int, choices=[15, 30], required=True,
+                    help="Frame rate the training data was sampled at. Determines "
+                         "the model/scaler filenames that test.py loads.")
+parser.add_argument('--input', default='blink_data.csv',
+                    help="Training data CSV (default: blink_data.csv). Use the CSV "
+                         "produced by 3_process_video_dataset.py at the matching fps.")
+args = parser.parse_args()
+
+INPUT_CSV_FILE = args.input
+MODEL_SAVE_PATH = f'blink_model_{args.fps}fps.keras'
+SCALER_SAVE_PATH = f'scaler_{args.fps}fps.joblib'
 # Number of frames to look back for context. A longer sequence helps the
 # model understand the motion of a blink.
 SEQUENCE_LENGTH = 5

@@ -15,6 +15,36 @@ RIGHT_EYE_CONTOUR_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 3
 ALL_EYE_INDICES = LEFT_EYE_CONTOUR_INDICES + RIGHT_EYE_CONTOUR_INDICES
 NOSE_TIP_INDEX = 1 # A stable point for normalization
 
+# --- Blink transient detection (shared by live detection and dataset
+# auto-labeling, so training labels match runtime behavior) ---
+# Blinks and squints are separated by DURATION, not amplitude: a fast blink
+# may only peak at ~0.10 on MediaPipe's blendshape score, while a squint can
+# sit at ~0.30 indefinitely.
+#
+# The score's eyes-open resting level varies by person and lighting
+# (measured ~0.03-0.05 for one user), so thresholds are RELATIVE to a
+# rolling open-eye baseline, not absolute: an excursion starts/ends when
+# the score crosses baseline + BS_FALL_DELTA, and counts as a blink if it
+# peaked at least BS_RISE_DELTA above baseline and completed within
+# MAX_BLINK_DURATION_S.
+BS_RISE_DELTA = 0.04
+BS_FALL_DELTA = 0.02
+MAX_BLINK_DURATION_S = 0.35
+
+# Rolling open-eye baseline window, shared by the blendshape and EAR
+# detectors. Samples are only collected while no excursion is in progress,
+# so blinks don't drag the baseline toward "closed".
+BASELINE_FRAMES = 90         # ~3s at 30fps
+MIN_BASELINE_SAMPLES = 20
+
+# --- EAR-dip transient detector (also shared) ---
+# The blendshape scores are temporally smoothed, so a 1-2 frame small blink
+# can vanish from that signal entirely. Raw landmarks (and therefore EAR)
+# react faster: a blink is a brief dip in EAR relative to the rolling
+# open-eye baseline, with the same duration gate as above.
+EAR_DIP_RATIO = 0.82        # blink requires EAR below baseline * this
+EAR_RECOVER_RATIO = 0.92    # dip event starts/ends crossing baseline * this
+
 
 def calculate_distance(p1, p2):
     """
