@@ -98,19 +98,34 @@ Watch the console:
 
 ## Key tunables (all in eye_feature_utils.py)
 
-Both detectors are now RELATIVE to a rolling open-eye baseline (the user's
-resting blendshape score measured ~0.03-0.05, so absolute thresholds broke:
-blink events never "closed" below an absolute 0.05 and got rejected as
-too-long squints — fixed 2026-07-11).
+**Updated 2026-07-12: Step 1 (diagnostic recording) is DONE and the
+detector was redesigned from that data.** The recording
+(`signals_20260712_143700.csv`: 43 quick blinks, 30 normal, 11 squints,
+1 head shake at ~45fps) showed:
+- Quick blinks peak at median 0.33 on the blendshape score - amplitude
+  thresholds can't separate them from squints (0.1-0.3 plateau overlap).
+- But VELOCITY separates them nearly perfectly: blinks close at 5-40
+  score/s, squints creep at <2.
+- Consecutive blinks merge into one long excursion (score never settles in
+  between), so the old classify-the-excursion-at-its-end detector
+  structurally missed them. A rising-edge velocity detector fires once
+  per blink inside a merged excursion.
+
+`tune_thresholds.py` replays a recording through the detector and sweeps
+constants; the deployed values below scored 65/73 marked blinks with 1
+squint fire (vs 57/73 and 4 fires for the previous hand-guessed set).
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `BS_RISE_DELTA` | 0.04 | blink needs score >= baseline + this |
-| `BS_FALL_DELTA` | 0.02 | excursion starts/ends crossing baseline + this |
-| `MAX_BLINK_DURATION_S` | 0.35 | longer events = squint, rejected (maybe 0.5 for drowsy data) |
+| `BS_VEL_THRESHOLD` | 2.5 | blink fires at score rise >= this (score/s) |
+| `BS_MIN_RISE` | 0.08 | ...and score >= baseline + this (amplitude floor) |
+| `BS_FALL_DELTA` | 0.03 | "settled" boundary: re-arms detector, ends excursion |
+| `MAX_BLINK_DURATION_S` | 0.5 | EAR-dip duration gate (blink dips ~250ms, squints ~1.9s) |
 | `BASELINE_FRAMES` | 90 | rolling baseline window (~3s), shared by both detectors |
-| `EAR_DIP_RATIO` | 0.82 | blink needs EAR below baseline x this |
-| `EAR_RECOVER_RATIO` | 0.92 | EAR dip event start/end boundary |
+| `EAR_DIP_RATIO` | 0.5 | blink needs EAR below baseline x this (deep-dip backup) |
+| `EAR_RECOVER_RATIO` | 0.85 | EAR dip event start/end boundary |
 
 These are shared by `test.py` (live) and `3_process_video_dataset.py`
-(labeling) — change once, affects both.
+(labeling) — change once, affects both. To re-tune after a new recording:
+`python tune_thresholds.py signals_<ts>.csv` (add `--diag` for per-event
+shape stats).

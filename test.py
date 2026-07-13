@@ -19,7 +19,8 @@ from eye_feature_utils import (
     RIGHT_EYE_EAR_INDICES,
     ALL_EYE_INDICES,
     NOSE_TIP_INDEX,
-    BS_RISE_DELTA,
+    BS_VEL_THRESHOLD,
+    BS_MIN_RISE,
     BS_FALL_DELTA,
     MAX_BLINK_DURATION_S,
     BASELINE_FRAMES,
@@ -104,22 +105,22 @@ feature_history = deque(maxlen=SEQUENCE_LENGTH)
 blink_event_detected = False
 last_blink_time = 0
 
-# Blendshape transient-detector state. An excursion starts when the score
-# crosses baseline + BS_FALL_DELTA and is classified when it ends: blink
-# (peaked >= BS_RISE_DELTA above baseline and brief), squint (high but
-# long), or a logged near-miss (too small to count).
+# Blendshape velocity-detector state (constants tuned on a marked
+# ground-truth recording; see eye_feature_utils.py). Fires on a fast rise
+# of the score with an amplitude floor, then disarms until the score
+# settles back near baseline - so each blink in a rapid burst re-fires,
+# even when the score never fully returns to baseline in between.
 bs_baseline_hist = deque(maxlen=BASELINE_FRAMES)
-bs_event_start = None
-bs_event_peak = 0.0
+bs_armed = True
+bs_settled = True          # score currently below baseline + BS_FALL_DELTA
+bs_prev_score = None
+bs_prev_time = None
 
 # EAR transient-detector state. The baseline history only collects samples
 # while the eyes look open, so blinks don't drag the baseline down.
 ear_baseline_hist = deque(maxlen=BASELINE_FRAMES)
 ear_event_start = None
 ear_event_min = 1.0
-# Highest MLP probability seen during the current blendshape event —
-# logged with each detected blink to show how close the custom model came.
-event_peak_prob = 0.0
 
 blink_timestamps = deque()     # Timestamps of recent blinks (last 60s)
 current_bpm = 0
@@ -212,43 +213,36 @@ while cap.isOpened():
             # If one eye is open (low score), the result will be low.
             blink_score = min(left_blink_score, right_blink_score)
 
-            # Collect baseline only while no excursion is in progress, so
-            # blinks/squints don't drag the baseline toward "closed".
-            if bs_event_start is None:
-                bs_baseline_hist.append(blink_score)
-
-            # --- Transient detection, relative to the rolling baseline ---
-            # The excursion is tracked from a LOW bar (baseline + FALL delta)
-            # and classified when it completes, so near-misses get logged
-            # with their actual peak instead of silently vanishing.
+            # --- Velocity (rising-edge) detection ---
+            # A blink closes the eyes at 5-40 score/s; a squint creeps up at
+            # <2 (measured). Fire when the score is rising fast AND sits at
+            # least BS_MIN_RISE above the rolling baseline, then disarm
+            # until it settles back near baseline so one closure can't
+            # fire twice - but a rapid burst of blinks fires once each.
             if len(bs_baseline_hist) >= MIN_BASELINE_SAMPLES:
                 bs_base = statistics.median(bs_baseline_hist)
-                if bs_event_start is None:
-                    if blink_score > bs_base + BS_FALL_DELTA:
-                        bs_event_start = current_time
-                        bs_event_peak = blink_score
-                        event_peak_prob = blink_prob
-                else:
-                    bs_event_peak = max(bs_event_peak, blink_score)
-                    event_peak_prob = max(event_peak_prob, blink_prob)
-                    if blink_score < bs_base + BS_FALL_DELTA:
-                        dur = current_time - bs_event_start
-                        rise = bs_event_peak - bs_base
-                        if rise >= BS_RISE_DELTA and dur <= MAX_BLINK_DURATION_S:
-                            if current_time - last_blink_time > BLINK_COOLDOWN_S:
-                                blink_event_detected = True
-                                last_blink_time = current_time # shared cooldown
-                                blink_timestamps.append(current_time) # BPM counter
-                                print(f"--- MEDIAPIPE BLINK DETECTED ({dur*1000:.0f}ms, "
-                                      f"peak +{rise:.3f} above base, "
-                                      f"MLP peaked at {event_peak_prob:.2f}) ---")
-                        elif rise >= BS_RISE_DELTA:
-                            print(f"[diag] BS plateau: +{rise:.3f} for {dur*1000:.0f}ms "
-                                  f"(too long - squint?)")
-                        else:
-                            print(f"[diag] BS near-miss: peak +{rise:.3f} above base, "
-                                  f"{dur*1000:.0f}ms (below rise delta {BS_RISE_DELTA})")
-                        bs_event_start = None
+                bs_settled = blink_score < bs_base + BS_FALL_DELTA
+                if bs_prev_time is not None and current_time > bs_prev_time:
+                    bs_vel = (blink_score - bs_prev_score) / (current_time - bs_prev_time)
+                    if (bs_armed and bs_vel >= BS_VEL_THRESHOLD
+                            and blink_score >= bs_base + BS_MIN_RISE
+                            and current_time - last_blink_time > BLINK_COOLDOWN_S):
+                        blink_event_detected = True
+                        last_blink_time = current_time  # shared cooldown
+                        blink_timestamps.append(current_time)  # BPM counter
+                        bs_armed = False
+                        print(f"--- MEDIAPIPE BLINK DETECTED (vel {bs_vel:.1f}/s, "
+                              f"score +{blink_score - bs_base:.3f} above base, "
+                              f"MLP at {blink_prob:.2f}) ---")
+                if not bs_armed and bs_settled:
+                    bs_armed = True
+
+            # Collect baseline only while the score is settled, so
+            # blinks/squints don't drag the baseline toward "closed".
+            if bs_settled:
+                bs_baseline_hist.append(blink_score)
+            bs_prev_score = blink_score
+            bs_prev_time = current_time
 
         # --- EAR TRANSIENT DETECTION ---
         # Catches small/fast blinks that the temporally-smoothed blendshape
@@ -261,9 +255,9 @@ while cap.isOpened():
         open_ear = max(left_ear, right_ear)
 
         # Collect baseline samples only while the eyes look open (no
-        # excursion in progress on either signal), so blinks don't drag
-        # the baseline down.
-        if ear_event_start is None and bs_event_start is None:
+        # dip in progress and the blendshape score settled), so blinks
+        # don't drag the baseline down.
+        if ear_event_start is None and bs_settled:
             ear_baseline_hist.append(open_ear)
 
         if len(ear_baseline_hist) >= MIN_BASELINE_SAMPLES:
@@ -321,11 +315,11 @@ while cap.isOpened():
                 blink_prob = float(model(sequence_scaled, training=False).numpy()[0][0])
 
                 # 4. Detect blink event with state machine and cooldown.
-                # The blendshape gate (an excursion must be in progress)
-                # vetoes MLP false fires from head motion, where the eyes
-                # stay fully open and the score sits at baseline.
+                # The blendshape gate (score must be off baseline) vetoes
+                # MLP false fires from head motion, where the eyes stay
+                # fully open and the score sits at baseline.
                 if (blink_prob > BLINK_PROB_THRESHOLD
-                        and bs_event_start is not None
+                        and not bs_settled
                         and not blink_event_detected
                         and (current_time - last_blink_time > BLINK_COOLDOWN_S)):
                     blink_event_detected = True
@@ -334,9 +328,13 @@ while cap.isOpened():
                     print(f"*** BLINK DETECTED (Prob: {blink_prob:.2f}) ***")
 
     else:
-        # Face lost: abandon any in-progress transient so a stale start
-        # time doesn't mislabel the next event.
-        bs_event_start = None
+        # Face lost: abandon any in-progress transient so stale state
+        # doesn't mislabel the next event, and drop the velocity sample
+        # so re-detection doesn't produce a huge spurious delta.
+        bs_prev_score = None
+        bs_prev_time = None
+        bs_armed = True
+        bs_settled = True
         ear_event_start = None
 
     # Reset the unified blink state if both detectors show eyes are open
@@ -353,12 +351,12 @@ while cap.isOpened():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_prob, 2)
 
     # MediaPipe Blendshape Display — show the min (what the detector
-    # actually uses) plus each eye's raw score.
+    # actually uses) plus its rolling baseline and armed state.
     bs_min = min(left_blink_score, right_blink_score)
     if len(bs_baseline_hist) >= MIN_BASELINE_SAMPLES:
         bs_base_disp = statistics.median(bs_baseline_hist)
         bs_text = (f"BS min: {bs_min:.3f} / base {bs_base_disp:.3f} "
-                   f"(trigger {bs_base_disp + BS_RISE_DELTA:.3f})")
+                   f"({'armed' if bs_armed else 'wait-settle'})")
     else:
         bs_text = f"BS min: {bs_min:.3f} (calibrating baseline...)"
     cv2.putText(frame, bs_text, (30, 70),

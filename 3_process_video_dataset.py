@@ -15,7 +15,8 @@ from eye_feature_utils import (
     RIGHT_EYE_EAR_INDICES,
     ALL_EYE_INDICES,
     NOSE_TIP_INDEX,
-    BS_RISE_DELTA,
+    BS_VEL_THRESHOLD,
+    BS_MIN_RISE,
     BS_FALL_DELTA,
     MAX_BLINK_DURATION_S,
     BASELINE_FRAMES,
@@ -55,57 +56,91 @@ def extract_features(landmarks):
 def label_blinks(scores, open_ears, fps):
     """
     Label blinks with the union of the two transient detectors used live
-    in test.py (same shared thresholds):
+    in test.py (same shared thresholds, tuned on a marked ground-truth
+    recording - see eye_feature_utils.py):
 
-    1. Blendshape transient, relative to a rolling open-eye baseline (the
-       resting score varies by person/lighting): an excursion starts/ends
-       crossing baseline + BS_FALL_DELTA, and counts as a blink if it
-       peaked >= BS_RISE_DELTA above baseline within MAX_BLINK_DURATION_S.
-       Longer plateaus (squints) are rejected -> hard negatives.
+    1. Blendshape velocity: a blink closes the eyes at 5-40 score/s while
+       a squint creeps up at <2, so fire when the score rises at
+       >= BS_VEL_THRESHOLD and sits >= BS_MIN_RISE above the rolling
+       open-eye baseline, then disarm until the score settles back below
+       baseline + BS_FALL_DELTA. This splits rapid blink bursts whose
+       score never returns to baseline in between (each blink re-fires),
+       which the old excursion-shape detector structurally missed.
+       The whole off-baseline span containing >= 1 firing is labeled 1;
+       off-baseline spans with no firing (slow rises = squints/closures)
+       become hard negatives.
     2. EAR dip: the blendshape score is temporally smoothed and can miss a
-       1-2 frame blink entirely, so a brief dip of EAR below the rolling
-       open-eye baseline also counts as a blink.
+       1-2 frame blink entirely, so a brief DEEP dip of EAR below the
+       rolling open-eye baseline also counts as a blink.
 
     Returns (labels, bs_blinks, ear_only_blinks, squint_count).
     """
     max_blink_frames = max(1, round(MAX_BLINK_DURATION_S * fps))
+    cooldown_frames = max(1, round(0.25 * fps))
     n = len(scores)
     labels = [0] * n
     bs_blinks = 0
     ear_only_blinks = 0
     squint_count = 0
 
-    # --- Detector 1: baseline-relative blendshape transient ---
-    # bs_excursion[i] records whether an excursion was in progress at frame
-    # i, so detector 2 can avoid polluting its EAR baseline with closed-eye
+    # --- Detector 1: baseline-relative blendshape velocity ---
+    # settled[i] records whether the score was near baseline at frame i, so
+    # detector 2 can avoid polluting its EAR baseline with closed-eye
     # frames (mirrors test.py's "collect only while both signals idle").
-    bs_excursion = [False] * n
+    settled = [True] * n
     base_hist = deque(maxlen=BASELINE_FRAMES)
-    event_start = None
-    event_peak = 0.0
+    armed = True
+    span_start = None      # start of the current off-baseline span
+    span_first_fire = None # first/last velocity firings within this span
+    span_last_fire = None
+    span_peak = 0.0
+    last_fire = -cooldown_frames
+    pre_fire_frames = max(1, round(0.1 * fps))
     for i, score in enumerate(scores):
-        if event_start is None:
-            base_hist.append(score)
-        if len(base_hist) < MIN_BASELINE_SAMPLES:
-            continue
-        base = statistics.median(base_hist)
-        if event_start is None:
-            if score > base + BS_FALL_DELTA:
-                event_start = i
-                event_peak = score
+        if len(base_hist) >= MIN_BASELINE_SAMPLES:
+            base = statistics.median(base_hist)
+            is_settled = score < base + BS_FALL_DELTA
+            vel = (score - scores[i - 1]) * fps if i > 0 else 0.0
+            if (armed and vel >= BS_VEL_THRESHOLD
+                    and score >= base + BS_MIN_RISE
+                    and i - last_fire > cooldown_frames):
+                bs_blinks += 1
+                if span_first_fire is None:
+                    span_first_fire = i
+                span_last_fire = i
+                last_fire = i
+                armed = False
+            if not armed and is_settled:
+                armed = True
         else:
-            bs_excursion[i] = True
-            event_peak = max(event_peak, score)
-            if score < base + BS_FALL_DELTA:
-                if event_peak - base >= BS_RISE_DELTA:
-                    if i - event_start <= max_blink_frames:
-                        for j in range(event_start, i):
-                            labels[j] = 1
-                        bs_blinks += 1
-                    else:
-                        squint_count += 1
-                event_start = None
-    # An event still open at the end of the video is dropped: we can't
+            is_settled = True
+        settled[i] = is_settled
+
+        # Track the off-baseline span for labeling/squint accounting.
+        # Label only the region around the firings, not the whole span: a
+        # blink followed by slow droopy reopening would otherwise mark
+        # seconds of half-open frames as blink=1.
+        if not is_settled:
+            if span_start is None:
+                span_start = i
+                span_peak = score
+            span_peak = max(span_peak, score)
+        elif span_start is not None:
+            if span_first_fire is not None:
+                lo = max(span_start, span_first_fire - pre_fire_frames)
+                hi = min(i, span_last_fire + max_blink_frames)
+                for j in range(lo, hi):
+                    labels[j] = 1
+            elif len(base_hist) >= MIN_BASELINE_SAMPLES and \
+                    span_peak - statistics.median(base_hist) >= BS_MIN_RISE:
+                squint_count += 1  # substantial closure with no fast rise
+            span_start = None
+            span_first_fire = None
+            span_last_fire = None
+
+        if is_settled:
+            base_hist.append(score)
+    # A span still open at the end of the video is dropped: we can't
     # tell whether it was a blink or a sustained closure.
 
     # --- Detector 2: EAR dip vs. rolling open-eye baseline ---
@@ -113,7 +148,7 @@ def label_blinks(scores, open_ears, fps):
     event_start = None
     event_min = 1.0
     for i, ear in enumerate(open_ears):
-        if event_start is None and not bs_excursion[i]:
+        if event_start is None and settled[i]:
             baseline_hist.append(ear)
         if len(baseline_hist) < MIN_BASELINE_SAMPLES:
             continue
@@ -167,6 +202,7 @@ def process_video(video_path, target_fps=None):
     print(f"Processing {video_path} ({total_frames} frames @ {video_fps:.1f}fps, "
           f"sampling every {frame_step} frame(s) -> {effective_fps:.1f}fps data)...")
 
+    last_timestamp_ms = -1
     for frame_idx in tqdm(range(total_frames)):
         success, frame = cap.read()
         if not success:
@@ -176,7 +212,12 @@ def process_video(video_path, target_fps=None):
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        # POS_MSEC glitches backwards on some codecs, and MediaPipe's VIDEO
+        # mode hard-errors on non-increasing timestamps - clamp to monotonic.
         timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
+        if timestamp_ms <= last_timestamp_ms:
+            timestamp_ms = last_timestamp_ms + 1
+        last_timestamp_ms = timestamp_ms
         results = landmarker.detect_for_video(mp_image, timestamp_ms)
 
         if results.face_landmarks and results.face_blendshapes:
@@ -202,7 +243,11 @@ def process_video(video_path, target_fps=None):
           f"({blink_frames} frames labeled 1) | "
           f"{squint_count} squints/closures rejected")
 
-    return [features + [label] for features, label in zip(features_per_frame, labels)]
+    # Person ID from the parent folder name (.../<person_id>/<clip>.mov),
+    # so training can group-split by person and avoid train/test leakage.
+    person_id = os.path.basename(os.path.dirname(os.path.abspath(video_path))) or "unknown"
+    return [features + [label, person_id]
+            for features, label in zip(features_per_frame, labels)]
 
 
 def main():
@@ -229,14 +274,19 @@ def main():
             csv_header = ['left_ear', 'right_ear']
             for i in range(len(ALL_EYE_INDICES)):
                 csv_header.extend([f'eye_lm_{i}_x', f'eye_lm_{i}_y'])
-            csv_header.append('is_blink')
+            csv_header.extend(['is_blink', 'person_id'])
             csv_writer.writerow(csv_header)
 
         for video_file in args.video_files:
             if not os.path.exists(video_file):
                 print(f"Warning: Video file not found at {video_file}")
                 continue
-            rows = process_video(video_file, args.target_fps)
+            # One corrupt clip must not abort a multi-hour batch run.
+            try:
+                rows = process_video(video_file, args.target_fps)
+            except Exception as e:
+                print(f"Error processing {video_file}: {e}")
+                continue
             csv_writer.writerows(rows)
             csvfile.flush()
             total_rows += len(rows)

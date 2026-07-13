@@ -17,19 +17,32 @@ NOSE_TIP_INDEX = 1 # A stable point for normalization
 
 # --- Blink transient detection (shared by live detection and dataset
 # auto-labeling, so training labels match runtime behavior) ---
-# Blinks and squints are separated by DURATION, not amplitude: a fast blink
-# may only peak at ~0.10 on MediaPipe's blendshape score, while a squint can
-# sit at ~0.30 indefinitely.
+#
+# All values below were tuned against a marked ground-truth recording
+# (signals_20260712_143700.csv: 43 quick blinks, 30 normal, 11 squints,
+# 1 head shake at ~45fps) by replaying the detector over it and sweeping
+# (tune_thresholds.py). Result: 65/73 marked blinks caught, 1 squint fire,
+# vs 57/73 and 4 fires for the previous hand-guessed constants.
+#
+# The blendshape detector fires on a fast RISE of the score (velocity),
+# not on excursion shape: blinks close the eyes at 5-40 score/s while
+# squints creep up at <2, so velocity separates them even when their
+# peak heights overlap. This also splits consecutive blinks whose score
+# never settles to baseline in between (merged excursions) - each blink
+# still has its own velocity spike, which an excursion-shape detector
+# structurally cannot see.
 #
 # The score's eyes-open resting level varies by person and lighting
-# (measured ~0.03-0.05 for one user), so thresholds are RELATIVE to a
-# rolling open-eye baseline, not absolute: an excursion starts/ends when
-# the score crosses baseline + BS_FALL_DELTA, and counts as a blink if it
-# peaked at least BS_RISE_DELTA above baseline and completed within
-# MAX_BLINK_DURATION_S.
-BS_RISE_DELTA = 0.04
-BS_FALL_DELTA = 0.02
-MAX_BLINK_DURATION_S = 0.35
+# (measured ~0.02-0.05), so amplitude gates are RELATIVE to a rolling
+# open-eye baseline, never absolute.
+BS_VEL_THRESHOLD = 2.5      # score/s rise speed that fires the detector
+BS_MIN_RISE = 0.08          # ...and score must be this far above baseline
+BS_FALL_DELTA = 0.03        # "settled": score back below baseline + this
+                            # (re-arms the detector; ends an excursion)
+
+# Duration gate for the EAR-dip detector below. Measured blink dips run
+# ~250ms median; squint dips ~1.9s, so 0.5s cleanly separates them.
+MAX_BLINK_DURATION_S = 0.5
 
 # Rolling open-eye baseline window, shared by the blendshape and EAR
 # detectors. Samples are only collected while no excursion is in progress,
@@ -40,10 +53,13 @@ MIN_BASELINE_SAMPLES = 20
 # --- EAR-dip transient detector (also shared) ---
 # The blendshape scores are temporally smoothed, so a 1-2 frame small blink
 # can vanish from that signal entirely. Raw landmarks (and therefore EAR)
-# react faster: a blink is a brief dip in EAR relative to the rolling
-# open-eye baseline, with the same duration gate as above.
-EAR_DIP_RATIO = 0.82        # blink requires EAR below baseline * this
-EAR_RECOVER_RATIO = 0.92    # dip event starts/ends crossing baseline * this
+# react faster: a blink is a brief deep dip in EAR relative to the rolling
+# open-eye baseline. Measured dips: normal blinks 96%, quick blinks 36%,
+# squints 29%, head shakes 19% - so the 50% depth requirement keeps this a
+# high-precision backup for solid closures while the velocity detector
+# handles the shallow/fast ones.
+EAR_DIP_RATIO = 0.5         # blink requires EAR below baseline * this
+EAR_RECOVER_RATIO = 0.85    # dip event starts/ends crossing baseline * this
 
 
 def calculate_distance(p1, p2):

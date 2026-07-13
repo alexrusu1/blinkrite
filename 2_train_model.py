@@ -2,7 +2,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import joblib # For saving the scaler object
@@ -36,6 +36,7 @@ print(f"Loaded {len(df)} total samples.")
 # Separate features (X) and labels (y).
 # This is robust enough to handle data with or without a 'person_id' column.
 y = df['is_blink'].values
+groups = df['person_id'].values if 'person_id' in df.columns else None
 columns_to_drop = ['is_blink']
 if 'person_id' in df.columns:
     columns_to_drop.append('person_id')
@@ -44,7 +45,7 @@ X = df.drop(columns=columns_to_drop).values
 # --- 2. Create Sequential Data ---
 # The model needs to see a sequence of frames to understand the *motion* of a blink.
 print(f"Creating sequences of length {SEQUENCE_LENGTH}...")
-X_seq, y_seq = [], []
+X_seq, y_seq, group_seq = [], [], []
 for i in range(len(X) - SEQUENCE_LENGTH + 1):
     # The sequence is the data from the last `SEQUENCE_LENGTH` frames
     sequence = X[i : i + SEQUENCE_LENGTH]
@@ -53,6 +54,8 @@ for i in range(len(X) - SEQUENCE_LENGTH + 1):
 
     X_seq.append(sequence.flatten()) # Flatten the sequence into a single feature vector
     y_seq.append(label)
+    if groups is not None:
+        group_seq.append(groups[i + SEQUENCE_LENGTH - 1])
 
 X_processed = np.array(X_seq)
 y_processed = np.array(y_seq)
@@ -65,10 +68,22 @@ print(f"Created {len(X_processed)} sequences.")
 print(f"Shape of a single feature vector: {X_processed[0].shape}")
 
 # --- 3. Split and Scale Data ---
-# Split into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(
-    X_processed, y_processed, test_size=TEST_SIZE, random_state=42, stratify=y_processed
-)
+# Split into training and testing sets. When person_id is available, split
+# by PERSON so nobody appears in both train and test - a random split lets
+# the model recognize faces it trained on, inflating test accuracy.
+if groups is not None:
+    print("Performing GroupShuffleSplit to prevent data leakage between persons...")
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=42)
+    train_idx, test_idx = next(gss.split(X_processed, y_processed, groups=group_seq))
+    X_train, X_test = X_processed[train_idx], X_processed[test_idx]
+    y_train, y_test = y_processed[train_idx], y_processed[test_idx]
+    print(f"Unique persons in training set: {np.unique(np.array(group_seq)[train_idx])}")
+    print(f"Unique persons in testing set: {np.unique(np.array(group_seq)[test_idx])}")
+else:
+    print("Performing standard train_test_split (no 'person_id' groups found)...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_processed, y_processed, test_size=TEST_SIZE, random_state=42, stratify=y_processed
+    )
 print(f"Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
 
 # Now, scale the data. Fit the scaler ONLY on the training data.
@@ -150,8 +165,9 @@ plt.ylabel('Loss')
 plt.xlabel('Epoch')
 plt.legend(['Train', 'Test'], loc='upper left')
 
-plt.savefig('training_history.png')
-print("Saved training history plot to training_history.png")
+history_path = f'training_history_{args.fps}fps.png'
+plt.savefig(history_path)
+print(f"Saved training history plot to {history_path}")
 
 # --- 8. Save the Model ---
 print(f"Saving the trained model to {MODEL_SAVE_PATH}...")
