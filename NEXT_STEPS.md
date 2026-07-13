@@ -1,5 +1,11 @@
 # Blink Detection — Next Steps (written 2026-07-10, late night)
 
+> **Update 2026-07-12:** `blink_monitor.py` is now the clean MVP — one
+> baseline-relative transient detector, minimal HUD, optional `--serial`
+> lamp link. `test.py` remains the noisy dev harness (3 detectors + diag
+> output). The MLP retraining plan below is still the path to
+> person-independent detection; the MVP doesn't use the MLP at all.
+
 ## Where things stand
 
 The goal is detecting **small/fast blinks** without counting **squints** or

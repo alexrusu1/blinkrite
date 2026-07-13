@@ -29,7 +29,10 @@ NOSE_TIP_INDEX = 1 # A stable point for normalization
 # MAX_BLINK_DURATION_S.
 BS_RISE_DELTA = 0.04
 BS_FALL_DELTA = 0.02
-MAX_BLINK_DURATION_S = 0.35
+# Real blinks run ~100ms (alert) to ~500ms (drowsy); squints and deliberate
+# closures plateau for seconds, so 0.5s cleanly separates them while still
+# counting slow drowsy blinks.
+MAX_BLINK_DURATION_S = 0.5
 
 # Rolling open-eye baseline window, shared by the blendshape and EAR
 # detectors. Samples are only collected while no excursion is in progress,
