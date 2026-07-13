@@ -40,8 +40,17 @@ BS_MIN_RISE = 0.08          # ...and score must be this far above baseline
 BS_FALL_DELTA = 0.03        # "settled": score back below baseline + this
                             # (re-arms the detector; ends an excursion)
 
-# Duration gate for the EAR-dip detector below. Measured blink dips run
-# ~250ms median; squint dips ~1.9s, so 0.5s cleanly separates them.
+# Legacy excursion-shape detector constants, still used by
+# blink_monitor.py (the MVP). Note: the ground-truth replay showed this
+# detector caught only 59/73 marked blinks at best (it can't split
+# consecutive blinks that merge into one excursion) - porting the MVP to
+# the velocity detector above is the known upgrade.
+BS_RISE_DELTA = 0.04
+
+# Duration gate, shared by the EAR-dip detector (below) and the legacy
+# excursion detector. Real blinks run ~100ms (alert) to ~500ms (drowsy);
+# measured squint dips plateau ~1.9s, so 0.5s cleanly separates them
+# while still counting slow drowsy blinks.
 MAX_BLINK_DURATION_S = 0.5
 
 # Rolling open-eye baseline window, shared by the blendshape and EAR
