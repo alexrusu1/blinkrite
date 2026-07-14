@@ -16,6 +16,8 @@ Quit:  press 'q' in the video window.
 """
 
 import argparse
+import csv
+import math
 import os
 import statistics
 import time
@@ -30,6 +32,7 @@ from mediapipe.tasks.python import vision
 from eye_feature_utils import (
     LEFT_EYE_CONTOUR_INDICES,
     RIGHT_EYE_CONTOUR_INDICES,
+    NOSE_TIP_INDEX,
     BS_RISE_DELTA,
     BS_FALL_DELTA,
     MAX_BLINK_DURATION_S,
@@ -39,6 +42,15 @@ from eye_feature_utils import (
 
 BLINK_COOLDOWN_S = 0.25    # ignore re-triggers within this window
 BLINK_FLASH_S = 0.4        # how long the on-screen blink indicator shows
+
+# Head-motion veto: fast head movement blurs and shifts the eye landmarks,
+# making the blink score spike exactly like a real blink. Motion is nose-tip
+# travel per frame, in units of the eye-to-eye distance (distance-invariant);
+# a blink detection is discarded if motion during it exceeded this. Blinks
+# made while actively shaking the head are sacrificed - acceptable trade.
+HEAD_MOTION_VETO = 0.08    # eye-span units per frame
+# Left/right outer eye corners, used as the scale reference
+LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 33, 263
 
 # Blink-rate alerting. A normal spontaneous rate is ~15-20 blinks/min;
 # focused screen use commonly suppresses it below 10.
@@ -57,29 +69,39 @@ class TransientBlinkDetector:
     BS_FALL_DELTA. Brief events (<= MAX_BLINK_DURATION_S) are blinks;
     longer plateaus (squints, deliberate closures) are rejected.
 
+    Blink vs. squint is decided by the event's WIDTH AT HALF-PEAK, not by
+    when the score returns to baseline: MediaPipe smooths the blendshape
+    signal, so a big blink has a long decay tail that would otherwise make
+    it look like a slow squint. Near its peak, a blink is a narrow spike
+    at any amplitude; a squint is a wide plateau at any amplitude.
+
     If an event stays open far longer than any closure gesture, the score
     has settled at a new resting level (posture or lighting changed), so
     the detector recalibrates its baseline instead of deadlocking.
     """
 
-    EVENT_TIMEOUT_S = 2.0
+    EVENT_TIMEOUT_S = 3.0
 
     def __init__(self):
         self.baseline_hist = deque(maxlen=BASELINE_FRAMES)
-        self.event_start = None
+        self.event = None  # list of (t, score) samples while an event is open
 
     @property
     def calibrated(self):
         return len(self.baseline_hist) >= MIN_BASELINE_SAMPLES
 
+    @property
+    def base(self):
+        return statistics.median(self.baseline_hist) if self.calibrated else None
+
     def reset(self):
         """Abandon any in-progress event (e.g. when the face is lost)."""
-        self.event_start = None
+        self.event = None
 
     def update(self, score, now):
         """Feed one frame's blink score.
 
-        Returns the blink's duration in seconds when a blink just
+        Returns the blink's half-peak width in seconds when a blink just
         completed, else None.
         """
         if not self.calibrated:
@@ -87,22 +109,27 @@ class TransientBlinkDetector:
             return None
 
         base = statistics.median(self.baseline_hist)
-        if self.event_start is None:
+        if self.event is None:
             if score > base + BS_RISE_DELTA:
-                self.event_start = now
+                self.event = [(now, score)]
             else:
                 # Only clearly-open frames feed the baseline, so blinks
                 # and squints can't drag it toward "closed".
                 self.baseline_hist.append(score)
             return None
 
-        duration = now - self.event_start
+        self.event.append((now, score))
         if score < base + BS_FALL_DELTA:
-            self.event_start = None
-            return duration if duration <= MAX_BLINK_DURATION_S else None
-        if duration > self.EVENT_TIMEOUT_S:
+            samples = self.event
+            self.event = None
+            peak = max(s for _, s in samples)
+            half_level = base + (peak - base) / 2.0
+            above = [t for t, s in samples if s >= half_level]
+            width = above[-1] - above[0] if above else 0.0
+            return width if width <= MAX_BLINK_DURATION_S else None
+        if now - self.event[0][0] > self.EVENT_TIMEOUT_S:
             self.baseline_hist.clear()  # adopt the new resting level
-            self.event_start = None
+            self.event = None
         return None
 
 
@@ -201,6 +228,14 @@ def main():
     alert_active = False
     start = time.time()
 
+    # Head-motion tracking for the veto (see HEAD_MOTION_VETO)
+    prev_nose = None
+    motion_hist = deque()  # (timestamp, motion in eye-spans/frame)
+
+    # Per-frame signal log, written on exit (overwritten each run) so a
+    # session that misbehaved can be analyzed afterwards from real data.
+    log_rows = []  # (t, score, base, motion, event_open, blink)
+
     print("Blinkrite running - press 'q' in the video window to quit.")
     while cap.isOpened():
         ok, frame = cap.read()
@@ -227,16 +262,46 @@ def main():
             blink_score = min(scores.get('eyeBlinkLeft', 0.0),
                               scores.get('eyeBlinkRight', 0.0))
 
+            # --- Head motion, in eye-spans per frame ---
+            nose = landmarks[NOSE_TIP_INDEX]
+            eye_span = math.hypot(
+                landmarks[LEFT_EYE_OUTER].x - landmarks[RIGHT_EYE_OUTER].x,
+                landmarks[LEFT_EYE_OUTER].y - landmarks[RIGHT_EYE_OUTER].y) or 1e-6
+            motion = 0.0
+            if prev_nose is not None:
+                motion = math.hypot(nose.x - prev_nose[0],
+                                    nose.y - prev_nose[1]) / eye_span
+            prev_nose = (nose.x, nose.y)
+            motion_hist.append((now, motion))
+            while motion_hist and motion_hist[0][0] < now - 2.0:
+                motion_hist.popleft()
+
             blink_dur = detector.update(blink_score, now)
-            if blink_dur is not None and now - last_blink_at > BLINK_COOLDOWN_S:
-                blink_times.append(now)
-                total_blinks += 1
-                last_blink_at = now
-                print(f"BLINK! ({blink_dur*1000:.0f}ms)  "
-                      f"rate: {len(blink_times)}/min  total: {total_blinks}")
+            counted = False
+            if blink_dur is not None:
+                # Peak head motion over the blink's own time window
+                window_start = now - blink_dur - 0.1
+                peak_motion = max((m for ts, m in motion_hist if ts >= window_start),
+                                  default=0.0)
+                if peak_motion > HEAD_MOTION_VETO:
+                    print(f"ignored: head motion during event "
+                          f"({peak_motion:.2f} eye-spans/frame)")
+                elif now - last_blink_at > BLINK_COOLDOWN_S:
+                    counted = True
+                    blink_times.append(now)
+                    total_blinks += 1
+                    last_blink_at = now
+                    print(f"BLINK! ({blink_dur*1000:.0f}ms, motion {peak_motion:.2f})  "
+                          f"rate: {len(blink_times)}/min  total: {total_blinks}")
+
+            log_rows.append((round(now - start, 3), round(blink_score, 4),
+                             round(detector.base, 4) if detector.base is not None else '',
+                             round(motion, 4), int(detector.event is not None),
+                             int(counted)))
             face_status = None
         else:
             detector.reset()
+            prev_nose = None
             face_status = ("NO FACE", (120, 120, 240))
 
         # --- Blink-rate status (with hysteresis so it doesn't flicker) ---
@@ -269,6 +334,13 @@ def main():
     landmarker.close()
     lamp.close()
     cv2.destroyAllWindows()
+
+    log_path = os.path.join(script_dir, 'last_session_log.csv')
+    with open(log_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['t', 'score', 'base', 'motion', 'event_open', 'blink'])
+        w.writerows(log_rows)
+    print(f"Session signal log saved to {log_path}")
 
 
 if __name__ == '__main__':
