@@ -14,6 +14,7 @@ While it runs, do each action and tag it right after with the key:
     n     = I just did a NORMAL blink
     s     = I just squinted
     h     = I just shook my head
+    w     = I just WINKED (one eye)
     q     = quit and save
 
 Tips: run it once in your normal lighting and once in the dark conditions
@@ -42,12 +43,14 @@ MARKER_KEYS = {
     ord('n'): 'normal_blink',
     ord('s'): 'squint',
     ord('h'): 'head_shake',
+    ord('w'): 'wink',
 }
 MARKER_COLORS = {
     'quick_blink': 'red',
     'normal_blink': 'green',
     'squint': 'orange',
     'head_shake': 'purple',
+    'wink': 'blue',
 }
 
 options = vision.FaceLandmarkerOptions(
@@ -101,7 +104,7 @@ def main():
 
         cv2.putText(frame, f"t={t:5.1f}s  frames={len(rows)}  marks={len(markers)}",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, "SPACE=quick n=normal s=squint h=shake q=quit",
+        cv2.putText(frame, "SPACE=quick n=normal s=squint h=shake w=wink q=quit",
                     (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         cv2.imshow('Signal Recorder', frame)
 

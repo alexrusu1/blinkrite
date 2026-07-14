@@ -40,6 +40,18 @@ BS_MIN_RISE = 0.08          # ...and score must be this far above baseline
 BS_FALL_DELTA = 0.03        # "settled": score back below baseline + this
                             # (re-arms the detector; ends an excursion)
 
+# Wink rejection. A hard wink sympathetically squeezes the other eye, so
+# min(left, right) alone can still rise like a quick blink. Real blinks
+# close both eyes together: measured |left - right| at the blink peak was
+# median 0.09 / max 0.24 across 73 ground-truth blinks, while a wink
+# drives the gap to ~0.5+. Events more asymmetric than this are ignored.
+BS_EYE_ASYM_MAX = 0.35
+
+# Partial-reopen re-arm. After firing, the detector re-arms when the score
+# settles near baseline OR has fallen this far from its post-fire peak -
+# so blinks still count when the eyes never fully reopen between them.
+BS_REARM_DROP = 0.15
+
 # Legacy excursion-shape detector constants, still used by
 # blink_monitor.py (the MVP). Note: the ground-truth replay showed this
 # detector caught only 59/73 marked blinks at best (it can't split
