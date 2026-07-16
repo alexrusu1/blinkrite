@@ -23,6 +23,9 @@ from eye_feature_utils import (
     MIN_BASELINE_SAMPLES,
     EAR_DIP_RATIO,
     EAR_RECOVER_RATIO,
+    EAR_ASYM_MAX,
+    WINK_LOOKBACK_S,
+    BLINK_CONFIRM_S,
 )
 
 # --- MediaPipe Setup (using the new Vision API) ---
@@ -53,11 +56,11 @@ def extract_features(landmarks):
     return features
 
 
-def label_blinks(scores, open_ears, fps):
+def label_blinks(scores, open_ears, ear_asyms, fps):
     """
     Label blinks with the union of the two transient detectors used live
-    in test.py (same shared thresholds, tuned on a marked ground-truth
-    recording - see eye_feature_utils.py):
+    (same shared thresholds, tuned on marked ground-truth recordings -
+    see eye_feature_utils.py):
 
     1. Blendshape velocity: a blink closes the eyes at 5-40 score/s while
        a squint creeps up at <2, so fire when the score rises at
@@ -66,22 +69,32 @@ def label_blinks(scores, open_ears, fps):
        baseline + BS_FALL_DELTA. This splits rapid blink bursts whose
        score never returns to baseline in between (each blink re-fires),
        which the old excursion-shape detector structurally missed.
-       The whole off-baseline span containing >= 1 firing is labeled 1;
-       off-baseline spans with no firing (slow rises = squints/closures)
-       become hard negatives.
+       Each firing must also pass the wink/head-shake gate: max EAR
+       asymmetry over [firing - WINK_LOOKBACK_S, firing + BLINK_CONFIRM_S]
+       stays under EAR_ASYM_MAX (mirrors blink_monitor.py's deferred
+       confirmation; offline we can just look at the window directly).
+       The whole off-baseline span containing >= 1 confirmed firing is
+       labeled 1; spans with none become hard negatives.
     2. EAR dip: the blendshape score is temporally smoothed and can miss a
        1-2 frame blink entirely, so a brief DEEP dip of EAR below the
        rolling open-eye baseline also counts as a blink.
 
-    Returns (labels, bs_blinks, ear_only_blinks, squint_count).
+    Returns (labels, bs_blinks, ear_only_blinks, squint_count, wink_count).
     """
     max_blink_frames = max(1, round(MAX_BLINK_DURATION_S * fps))
     cooldown_frames = max(1, round(0.25 * fps))
+    lookback_frames = max(1, round(WINK_LOOKBACK_S * fps))
+    confirm_frames = max(1, round(BLINK_CONFIRM_S * fps))
     n = len(scores)
     labels = [0] * n
     bs_blinks = 0
     ear_only_blinks = 0
     squint_count = 0
+    wink_count = 0
+
+    def symmetric_at(i):
+        window = ear_asyms[max(0, i - lookback_frames):min(n, i + confirm_frames + 1)]
+        return max(window) <= EAR_ASYM_MAX if window else True
 
     # --- Detector 1: baseline-relative blendshape velocity ---
     # settled[i] records whether the score was near baseline at frame i, so
@@ -104,11 +117,14 @@ def label_blinks(scores, open_ears, fps):
             if (armed and vel >= BS_VEL_THRESHOLD
                     and score >= base + BS_MIN_RISE
                     and i - last_fire > cooldown_frames):
-                bs_blinks += 1
-                if span_first_fire is None:
-                    span_first_fire = i
-                span_last_fire = i
-                last_fire = i
+                if symmetric_at(i):
+                    bs_blinks += 1
+                    if span_first_fire is None:
+                        span_first_fire = i
+                    span_last_fire = i
+                    last_fire = i
+                else:
+                    wink_count += 1  # asymmetric event: wink or head shake
                 armed = False
             if not armed and is_settled:
                 armed = True
@@ -160,15 +176,19 @@ def label_blinks(scores, open_ears, fps):
         else:
             event_min = min(event_min, ear)
             if ear >= baseline * EAR_RECOVER_RATIO:
+                # Same wink/head-shake gate as detector 1: both eyes must
+                # move together over the whole dip.
+                dip_symmetric = max(ear_asyms[event_start:i + 1]) <= EAR_ASYM_MAX
                 if (event_min < baseline * EAR_DIP_RATIO
-                        and i - event_start <= max_blink_frames):
+                        and i - event_start <= max_blink_frames
+                        and dip_symmetric):
                     if not any(labels[event_start:i]):
                         ear_only_blinks += 1  # detector 1 missed this one
                     for j in range(event_start, i):
                         labels[j] = 1
                 event_start = None
 
-    return labels, bs_blinks, ear_only_blinks, squint_count
+    return labels, bs_blinks, ear_only_blinks, squint_count, wink_count
 
 
 def process_video(video_path, target_fps=None):
@@ -197,6 +217,7 @@ def process_video(video_path, target_fps=None):
     features_per_frame = []
     scores_per_frame = []
     open_ears_per_frame = []
+    ear_asyms_per_frame = []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Processing {video_path} ({total_frames} frames @ {video_fps:.1f}fps, "
@@ -231,17 +252,19 @@ def process_video(video_path, target_fps=None):
                                         blendshapes.get('eyeBlinkRight', 0)))
             # more-open eye: both must dip for a blink (wink-safe)
             open_ears_per_frame.append(max(features[0], features[1]))
+            # left/right EAR gap: the wink/head-shake discriminator
+            ear_asyms_per_frame.append(abs(features[0] - features[1]))
 
     cap.release()
     landmarker.close()
 
-    labels, bs_blinks, ear_only_blinks, squint_count = label_blinks(
-        scores_per_frame, open_ears_per_frame, effective_fps)
+    labels, bs_blinks, ear_only_blinks, squint_count, wink_count = label_blinks(
+        scores_per_frame, open_ears_per_frame, ear_asyms_per_frame, effective_fps)
     blink_frames = sum(labels)
     print(f"  {len(features_per_frame)} usable frames | "
           f"{bs_blinks} blendshape blinks + {ear_only_blinks} EAR-only blinks "
           f"({blink_frames} frames labeled 1) | "
-          f"{squint_count} squints/closures rejected")
+          f"{squint_count} squints/closures + {wink_count} winks/shakes rejected")
 
     # Person ID from the parent folder name (.../<person_id>/<clip>.mov),
     # so training can group-split by person and avoid train/test leakage.

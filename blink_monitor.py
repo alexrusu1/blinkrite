@@ -8,11 +8,12 @@ to the Blinkrite lamp (ESP32) over serial so it can adjust its bias lighting.
 Detection uses MediaPipe FaceLandmarker blendshape blink scores with a
 velocity detector: a blink is a FAST RISE of the score relative to a
 rolling per-user baseline (blinks close at 5-40 score/s, squints creep at
-<2 - constants tuned on a marked ground-truth recording; 67/73 marked
-blinks vs 62/73 for the previous excursion detector). A left/right
-symmetry gate rejects winks, a reopening-edge re-arm keeps counting when
-consecutive blinks never fully reopen in between, and a head-motion veto
-discards events during fast head movement.
+<2 - constants tuned on marked ground-truth recordings; 148/153 marked
+blinks). Winks and head shakes are rejected by deferred confirmation on
+EAR asymmetry (0/30 winks, 0/5 head shakes counted on the recordings), a
+reopening-edge re-arm keeps counting when consecutive blinks never fully
+reopen in between, and a head-motion veto discards events during fast
+head movement.
 
 Run:   python3 blink_monitor.py [--serial PORT] [--camera N]
 Quit:  press 'q' in the video window.
@@ -35,12 +36,17 @@ from mediapipe.tasks.python import vision
 from eye_feature_utils import (
     LEFT_EYE_CONTOUR_INDICES,
     RIGHT_EYE_CONTOUR_INDICES,
+    LEFT_EYE_EAR_INDICES,
+    RIGHT_EYE_EAR_INDICES,
     NOSE_TIP_INDEX,
+    calculate_ear,
     BS_VEL_THRESHOLD,
     BS_MIN_RISE,
     BS_FALL_DELTA,
-    BS_EYE_ASYM_MAX,
     BS_REARM_DROP,
+    EAR_ASYM_MAX,
+    WINK_LOOKBACK_S,
+    BLINK_CONFIRM_S,
     BASELINE_FRAMES,
     MIN_BASELINE_SAMPLES,
 )
@@ -48,12 +54,13 @@ from eye_feature_utils import (
 BLINK_COOLDOWN_S = 0.25    # ignore re-triggers within this window
 BLINK_FLASH_S = 0.4        # how long the on-screen blink indicator shows
 
-# Head-motion veto: fast head movement blurs and shifts the eye landmarks,
-# making the blink score spike exactly like a real blink. Motion is nose-tip
-# travel per frame, in units of the eye-to-eye distance (distance-invariant);
-# a blink detection is discarded if motion during it exceeded this. Blinks
-# made while actively shaking the head are sacrificed - acceptable trade.
-HEAD_MOTION_VETO = 0.08    # eye-span units per frame
+# Head motion is measured as nose-tip travel per frame, in units of the
+# eye-to-eye distance (distance-invariant), and recorded in the session
+# log for diagnostics. It is NOT used to veto detections: real blinks
+# made while the head moves should count, and motion-without-blink is
+# already rejected by the EAR-asymmetry confirmation (head motion shifts
+# the two eyes' landmarks differently; a real blink keeps them moving
+# together).
 # Left/right outer eye corners, used as the scale reference
 LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 33, 263
 
@@ -74,10 +81,15 @@ class VelocityBlinkDetector:
     lighting). This catches fast/partial blinks a fixed threshold misses
     and rejects squints without needing a duration gate.
 
-    Wink rejection: a hard wink sympathetically squeezes the other eye,
-    so even min(left, right) can rise like a quick blink. Real blinks
-    close both eyes together (measured |left-right| at the peak <= 0.24),
-    so events with a large left/right gap are ignored.
+    Wink and head-shake rejection: a hard wink sympathetically squeezes
+    the other eye, so even min(left, right) rises like a quick blink -
+    and the smoothed blendshape left/right gap overlaps real blinks, so
+    it can't discriminate. Raw-landmark EAR asymmetry can (blinks stay
+    under ~0.13, winks/head-shakes exceed ~0.26), but a wink's asymmetry
+    can peak BEFORE the trigger, so a triggered event stays PENDING for
+    BLINK_CONFIRM_S and is confirmed as a blink only if the max EAR
+    asymmetry over [trigger - WINK_LOOKBACK_S, trigger + BLINK_CONFIRM_S]
+    stays under EAR_ASYM_MAX.
 
     After firing, the detector disarms until the score either settles
     back near baseline or falls BS_REARM_DROP below its post-fire peak -
@@ -93,11 +105,13 @@ class VelocityBlinkDetector:
 
     def __init__(self):
         self.baseline_hist = deque(maxlen=BASELINE_FRAMES)
+        self.ear_asym_hist = deque()   # (t, |left_ear - right_ear|)
         self.armed = True
         self.prev_score = None
         self.prev_time = None
         self.post_fire_peak = 0.0
         self.last_settled_at = None
+        self.pending = None            # (trigger_t, max_ear_asym, trigger_vel)
 
     @property
     def calibrated(self):
@@ -113,23 +127,41 @@ class VelocityBlinkDetector:
         self.prev_score = None
         self.prev_time = None
         self.armed = True
+        self.pending = None
+        self.ear_asym_hist.clear()
 
-    def update(self, left_score, right_score, now):
-        """Feed one frame's per-eye blink scores.
+    def update(self, left_score, right_score, left_ear, right_ear, now):
+        """Feed one frame's per-eye blink scores and EARs.
 
-        Returns the blink's rise velocity (score/s) when a blink was just
-        detected, else None.
+        Returns the trigger's rise velocity (score/s) when a blink is
+        CONFIRMED - i.e. ~BLINK_CONFIRM_S after the actual blink - else
+        None.
         """
-        # min of both eyes: robust starting point against winks...
         score = min(left_score, right_score)
-        # ...but a hard wink still bleeds into the other eye, so reject
-        # any event where the eyes disagree too much to be a real blink.
-        symmetric = abs(left_score - right_score) <= BS_EYE_ASYM_MAX
+        ear_asym = abs(left_ear - right_ear)
+
+        self.ear_asym_hist.append((now, ear_asym))
+        while self.ear_asym_hist and self.ear_asym_hist[0][0] < now - WINK_LOOKBACK_S:
+            self.ear_asym_hist.popleft()
+
+        # Resolve any pending event: confirm as a blink once the window
+        # elapses with the eyes staying symmetric; a wink or head shake
+        # pushes EAR asymmetry over the gate and cancels it.
+        confirmed = None
+        if self.pending is not None:
+            trigger_t, max_asym, trigger_vel = self.pending
+            max_asym = max(max_asym, ear_asym)
+            if now - trigger_t >= BLINK_CONFIRM_S:
+                if max_asym <= EAR_ASYM_MAX:
+                    confirmed = trigger_vel
+                self.pending = None
+            else:
+                self.pending = (trigger_t, max_asym, trigger_vel)
 
         if not self.calibrated:
             self.baseline_hist.append(score)
             self.last_settled_at = now
-            return None
+            return confirmed
 
         base = statistics.median(self.baseline_hist)
         settled = score < base + BS_FALL_DELTA
@@ -140,13 +172,14 @@ class VelocityBlinkDetector:
         self.prev_score = score
         self.prev_time = now
 
-        fired = None
-        if (self.armed and symmetric
+        if (self.armed and self.pending is None
                 and vel >= BS_VEL_THRESHOLD
                 and score >= base + BS_MIN_RISE):
             self.armed = False
             self.post_fire_peak = score
-            fired = vel
+            # Seed with asymmetry already seen in the lookback - a wink's
+            # asymmetry peak often precedes the min-score trigger.
+            self.pending = (now, max(a for _, a in self.ear_asym_hist), vel)
 
         if not self.armed:
             self.post_fire_peak = max(self.post_fire_peak, score)
@@ -165,7 +198,7 @@ class VelocityBlinkDetector:
             self.baseline_hist.clear()  # adopt the new resting level
             self.last_settled_at = now
 
-        return fired
+        return confirmed
 
 
 class LampLink:
@@ -296,6 +329,9 @@ def main():
             left_score = scores.get('eyeBlinkLeft', 0.0)
             right_score = scores.get('eyeBlinkRight', 0.0)
             blink_score = min(left_score, right_score)  # for the session log
+            # Raw-landmark EARs: the wink/head-shake discriminator
+            left_ear = calculate_ear(landmarks, LEFT_EYE_EAR_INDICES)
+            right_ear = calculate_ear(landmarks, RIGHT_EYE_EAR_INDICES)
 
             # --- Head motion, in eye-spans per frame ---
             nose = landmarks[NOSE_TIP_INDEX]
@@ -311,25 +347,23 @@ def main():
             while motion_hist and motion_hist[0][0] < now - 2.0:
                 motion_hist.popleft()
 
-            blink_vel = detector.update(left_score, right_score, now)
+            blink_vel = detector.update(left_score, right_score,
+                                        left_ear, right_ear, now)
             counted = False
-            if blink_vel is not None:
-                # Peak head motion over the closing edge just detected
-                # (velocity fires at the fast rise, so a fixed lookback
-                # covers the whole event so far).
-                window_start = now - 0.5
+            if blink_vel is not None and now - last_blink_at > BLINK_COOLDOWN_S:
+                # Peak head motion over the event window, logged for
+                # diagnostics only - blinks during head movement count,
+                # and motion-without-blink was already rejected by the
+                # detector's EAR-asymmetry confirmation.
+                window_start = now - BLINK_CONFIRM_S - 0.5
                 peak_motion = max((m for ts, m in motion_hist if ts >= window_start),
                                   default=0.0)
-                if peak_motion > HEAD_MOTION_VETO:
-                    print(f"ignored: head motion during event "
-                          f"({peak_motion:.2f} eye-spans/frame)")
-                elif now - last_blink_at > BLINK_COOLDOWN_S:
-                    counted = True
-                    blink_times.append(now)
-                    total_blinks += 1
-                    last_blink_at = now
-                    print(f"BLINK! (vel {blink_vel:.1f}/s, motion {peak_motion:.2f})  "
-                          f"rate: {len(blink_times)}/min  total: {total_blinks}")
+                counted = True
+                blink_times.append(now)
+                total_blinks += 1
+                last_blink_at = now
+                print(f"BLINK! (vel {blink_vel:.1f}/s, motion {peak_motion:.2f})  "
+                      f"rate: {len(blink_times)}/min  total: {total_blinks}")
 
             log_rows.append((round(now - start, 3), round(blink_score, 4),
                              round(detector.base, 4) if detector.base is not None else '',

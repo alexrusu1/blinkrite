@@ -40,12 +40,21 @@ BS_MIN_RISE = 0.08          # ...and score must be this far above baseline
 BS_FALL_DELTA = 0.03        # "settled": score back below baseline + this
                             # (re-arms the detector; ends an excursion)
 
-# Wink rejection. A hard wink sympathetically squeezes the other eye, so
-# min(left, right) alone can still rise like a quick blink. Real blinks
-# close both eyes together: measured |left - right| at the blink peak was
-# median 0.09 / max 0.24 across 73 ground-truth blinks, while a wink
-# drives the gap to ~0.5+. Events more asymmetric than this are ignored.
-BS_EYE_ASYM_MAX = 0.35
+# Wink/head-shake rejection via EAR asymmetry with deferred confirmation.
+# A hard wink sympathetically squeezes the other eye, so min(left, right)
+# of the BLENDSHAPE scores rises like a quick blink - and because those
+# scores are temporally smoothed, their left/right gap overlaps real
+# blinks (wink p10 0.23 vs quick-blink median 0.22; unusable). Raw-
+# landmark EAR asymmetry separates cleanly: blink medians 0.08-0.13 vs
+# wink p10 0.26 and head-shake p10 0.27 (30 winks / 80 blinks measured).
+# A wink's asymmetry can peak BEFORE the velocity trigger, so a triggered
+# event stays PENDING for BLINK_CONFIRM_S and confirms only if max EAR
+# asymmetry over [trigger - WINK_LOOKBACK_S, trigger + BLINK_CONFIRM_S]
+# stays under the gate. Result on the two marked recordings: 148/153
+# blinks, 0/30 winks, 0/5 head shakes counted.
+EAR_ASYM_MAX = 0.18
+WINK_LOOKBACK_S = 0.5
+BLINK_CONFIRM_S = 0.35
 
 # Partial-reopen re-arm. After firing, the detector re-arms when the score
 # settles near baseline OR has fallen this far from its post-fire peak -
